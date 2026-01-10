@@ -2,28 +2,61 @@ import os
 import joblib
 import argparse
 
-import numpy as np
-import torch
-from sklearn.linear_model import LinearRegression
 from lightgbm import LGBMRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+import torch
 
-from data_utils import get_all_data
-from models import GRUModel, Autoencoder
-from env import (
-    DATETIME_COL, NUMERICAL_FEATURES, CATEGORICAL_FEATURES, GROUPBY_COLS,
-    TARGET_COL, MODEL_DIR, GRU_INPUT_SIZE, GRU_HIDDEN_SIZE, GRU_OUTPUT_SIZE,
-    GRU_LAYERS, LATENT_DIM, PT_DATA_PATH
+from env import Features, GruParams, AEParams, PT_DATA_PATH, MODEL_DIR, DataSourceType
+from models import (
+    Autoencoder,
+    CategoricalEmbeddingEncoder,
+    GRUModel,
+    LGBMModel,
+    MetaLearner,
 )
+from utils.data import get_all_data, create_results_df
+from utils.metrics import calculate_metrics
+from utils.unscale import unscale
 
 
-def get_models(device):
+def get_models(
+    device: torch.device,
+) -> (
+    GRUModel,
+    Autoencoder,
+    LGBMRegressor,
+    LinearRegression,
+    StandardScaler,
+    CategoricalEmbeddingEncoder,
+):
+    """
+    Load all trained models and preprocessing artifacts.
+
+    Args:
+        device (torch.device): PyTorch device.
+
+    Returns:
+        GRUModel: Trained GRU model.
+        Autoencoder: Trained autoencoder.
+        LGBMRegressor: Trained LightGBM model.
+        LinearRegression: Trained meta-learner.
+        StandardScaler: Fitted scaler.
+        CategoricalEmbeddingEncoder: Fitted categorical embedder.
+    """
+
     gru_model = GRUModel(
-        GRU_INPUT_SIZE, GRU_HIDDEN_SIZE, GRU_OUTPUT_SIZE, GRU_LAYERS
+        input_size=GruParams.GRU_INPUT_SIZE,
+        hidden_size=GruParams.GRU_HIDDEN_SIZE,
+        output_size=GruParams.GRU_OUTPUT_SIZE,
+        num_layers=GruParams.GRU_LAYERS,
     ).to(device)
     gru_model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "gru_model.pt")))
     gru_model.eval()
 
-    autoencoder = Autoencoder(len(NUMERICAL_FEATURES), LATENT_DIM).to(device)
+    autoencoder = Autoencoder(len(Features.NUMERICAL_FEATURES), AEParams.LATENT_DIM).to(
+        device
+    )
     autoencoder.load_state_dict(torch.load(os.path.join(MODEL_DIR, "autoencoder.pt")))
     autoencoder.eval()
 
@@ -35,28 +68,57 @@ def get_models(device):
     return gru_model, autoencoder, lgbm_model, meta_learner, scaler, embedder
 
 
-def predict(gru, autoencoder, lgbm, meta, scaler, embedder, df_type, suffix, rerun_gru_dataset):
+def predict(
+    gru: GRUModel,
+    autoencoder: Autoencoder,
+    lgbm: LGBMModel,
+    meta: MetaLearner,
+    scaler: StandardScaler,
+    embedder: CategoricalEmbeddingEncoder,
+    df_type: DataSourceType,
+    suffix: str,
+    rerun_gru_dataset: bool,
+):
+    """
+    Run full inference pipeline and computes evaluation metrics.
+
+    Args:
+        gru (GRUModel): Trained GRU model.
+        autoencoder (Autoencoder): Trained autoencoder.
+        lgbm: Trained LightGBM model.
+        meta: Trained meta-learner.
+        scaler (StandardScaler): Fitted scaler.
+        embedder (CategoricalEmbeddingEncoder): Fitted embedder.
+        df_type (DataSourceType): Dataset split to use.
+        suffix (str): Dataset suffix.
+        rerun_gru_dataset (bool): Whether to rebuild GRU dataset.
+
+    Returns:
+        pd.DataFrame: Prediction results.
+        dict: Evaluation metrics.
+    """
+
     num_df, cat_df, weekly_df, gru_loader, _, _ = get_all_data(
-        dt_col=DATETIME_COL,
-        numerical_cols=NUMERICAL_FEATURES,
-        categorical_cols=CATEGORICAL_FEATURES,
-        groupby_cols=GROUPBY_COLS,
-        target_col=TARGET_COL,
-        gru_dataset_path=os.path.join(
-            PT_DATA_PATH, f"train_dataset{suffix}.pt"
-        ),
+        dt_col=Features.DATETIME_COL,
+        numerical_cols=Features.NUMERICAL_FEATURES,
+        categorical_cols=Features.CATEGORICAL_FEATURES,
+        groupby_cols=Features.GROUPBY_COLS,
+        target_col=Features.TARGET_COL,
+        gru_dataset_path=os.path.join(PT_DATA_PATH, f"train_dataset{suffix}.pt"),
         scaler=scaler,
         embedder=embedder,
         df_type=df_type,
-        rerun_gru_dataset=rerun_gru_dataset
+        rerun_gru_dataset=rerun_gru_dataset,
     )
 
-    gru_preds, gru_targets = get_gru_predictions(gru, gru_loader)
-    latent = get_latent_representation(autoencoder, num_df)
-    lgbm_preds = get_lgbm_predictions(lgbm, weekly_df, latent, cat_df)
-    meta_preds = get_meta_predictions(meta, gru_preds, lgbm_preds)
+    gru_preds, gru_targets = gru.get_predictions(gru_loader)
+    latent = autoencoder.get_latent_representation(autoencoder, num_df)
+    lgbm_preds = lgbm.predict(weekly_df, latent, cat_df)
+    meta_preds = meta.predict(gru_preds, lgbm_preds)
 
-    target_idx = num_df.columns.get_loc(TARGET_COL) - len(GROUPBY_COLS) - 1
+    target_idx = (
+        num_df.columns.get_loc(Features.TARGET_COL) - len(Features.GROUPBY_COLS) - 1
+    )
     mean = scaler.mean_[target_idx]
     scale = scaler.scale_[target_idx]
 
@@ -65,87 +127,39 @@ def predict(gru, autoencoder, lgbm, meta, scaler, embedder, df_type, suffix, rer
     lgbm_preds = unscale(mean, scale, lgbm_preds)
     meta_preds = unscale(mean, scale, meta_preds)
 
-    results = create_results_df(
-        num_df, gru_preds, lgbm_preds, meta_preds, gru_targets
-    )
+    results = create_results_df(num_df, gru_preds, lgbm_preds, meta_preds, gru_targets)
     metrics = calculate_metrics(results)
 
     return results, metrics
 
 
-def get_gru_predictions(model, data_loader):
-    preds, targets = [], []
-    with torch.no_grad():
-        for x_batch, y_batch in data_loader:
-            x_batch = x_batch.to(device)
-            hidden = model.init_hidden(x_batch.size(0)).to(device)
-            output, _ = model(x_batch, hidden)
-            preds.append(output[:, -1, 0].cpu().numpy())
-            targets.append(y_batch.numpy())
+def main(
+    gru: GRUModel,
+    autoencoder: Autoencoder,
+    lgbm: LGBMModel,
+    meta: MetaLearner,
+    scaler: StandardScaler,
+    embedder: CategoricalEmbeddingEncoder,
+    suffix: str,
+    rerun_gru_dataset: bool,
+):
+    """
+    Entry point for inference execution.
 
-    return np.concatenate(preds), np.concatenate(targets)
+    Args:
+        gru (GRUModel): Trained GRU.
+        autoencoder (Autoencoder): Trained autoencoder.
+        lgbm: Trained LightGBM.
+        meta: Trained meta-learner.
+        scaler (StandardScaler): Fitted scaler.
+        embedder (CategoricalEmbeddingEncoder): Fitted embedder.
+        suffix (str): Dataset suffix.
+        rerun_gru_dataset (bool): Whether to rebuild GRU dataset.
 
+    Returns:
+        None
+    """
 
-def get_latent_representation(autoencoder, num_df):
-    with torch.no_grad():
-        data_tensor = torch.tensor(
-            num_df[NUMERICAL_FEATURES].values, dtype=torch.float32
-        ).to(device)
-        _, latent = autoencoder(data_tensor)
-
-    return latent.cpu().detach().numpy()
-
-
-def get_lgbm_predictions(lgbm, weekly_df, latent, cat_df):
-    lgbm_input = np.hstack([
-        weekly_df.drop(columns=[DATETIME_COL, *GROUPBY_COLS]).values,
-        latent,
-        cat_df.drop(columns=[DATETIME_COL, *GROUPBY_COLS]).values
-    ])
-
-    return lgbm.predict(lgbm_input)
-
-
-def get_meta_predictions(meta, gru_preds, lgbm_preds):
-    common_len = min(len(gru_preds), len(lgbm_preds))
-    meta_input = np.vstack([
-        gru_preds[:common_len], lgbm_preds[:common_len]
-    ]).T
-
-    return meta.predict(meta_input)
-
-
-def create_results_df(num_df, gru_preds, lgbm_preds, meta_preds, targets):
-    common_len = min(len(gru_preds), len(lgbm_preds), len(meta_preds))
-
-    df_subset = num_df.iloc[:common_len].copy()
-
-    df_subset["gru_prediction"] = gru_preds[:common_len]
-    df_subset["lgbm_prediction"] = lgbm_preds[:common_len]
-    df_subset["ensemble_prediction"] = meta_preds[:common_len]
-
-    df_subset["actual"] = targets[:common_len]
-
-    return df_subset
-
-
-def calculate_metrics(results_df):
-    metrics = {}
-
-    for model in ["gru", "lgbm", "ensemble"]:
-        pred_col = f"{model}_prediction"
-        metrics[f"{model}_mae"] = np.mean(
-            np.abs(results_df[pred_col] - results_df["actual"])
-        )
-
-    return metrics
-
-
-def unscale(mean, scale, arr):
-    return mean + arr * scale
-
-
-def main(gru, autoencoder, lgbm, meta, scaler, embedder, suffix, rerun_gru_dataset):
     results, metrics = predict(
         gru, autoencoder, lgbm, meta, scaler, embedder, suffix, rerun_gru_dataset
     )
@@ -161,9 +175,17 @@ def main(gru, autoencoder, lgbm, meta, scaler, embedder, suffix, rerun_gru_datas
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run inference")
-    parser.add_argument("--models", type=str, default=MODEL_DIR)
-    parser.add_argument("--suffix", type=str, default="")
-    parser.add_argument("--rerun_gru_datasets", action="store_false")
+    parser.add_argument(
+        "--models", type=str, default=MODEL_DIR, help="Path to the dir with models"
+    )
+    parser.add_argument(
+        "--suffix", type=str, default="", help="Suffix for the model and dataset names"
+    )
+    parser.add_argument(
+        "--rerun_gru_datasets",
+        action="store_false",
+        help="Binary, whether to recreate PyTorch datasets for GRU model",
+    )
     return parser.parse_args()
 
 
@@ -171,4 +193,13 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     gru, autoencoder, lgbm, meta, scaler, embedder = get_models(device)
     args = parse_args()
-    main(gru, autoencoder, lgbm, meta, scaler, embedder, args.suffix, args.rerun_gru_datasets)
+    main(
+        gru,
+        autoencoder,
+        lgbm,
+        meta,
+        scaler,
+        embedder,
+        args.suffix,
+        args.rerun_gru_datasets,
+    )

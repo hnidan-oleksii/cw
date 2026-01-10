@@ -6,5 +6,5 @@ __pycache__/
 data/
 *.pt
 *.pkl
-model*/
+trained_model*/
 runs*/
